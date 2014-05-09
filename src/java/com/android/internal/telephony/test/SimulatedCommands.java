@@ -1677,4 +1677,6 @@ public final class SimulatedCommands extends BaseCommands
             int retry, int messageRef, Message response){
         unimplemented(response);
     }
+
+    public boolean needsOldRilFeature(String feature) { return false; }
 }

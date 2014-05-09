@@ -58,6 +58,8 @@ import com.android.internal.telephony.DctConstants;
 import com.android.internal.telephony.EventLogTags;
 import com.android.internal.telephony.TelephonyIntents;
 import com.android.internal.telephony.gsm.GSMPhone;
+import com.android.internal.telephony.cdma.CDMAPhone;
+import com.android.internal.telephony.cdma.CdmaSubscriptionSourceManager;
 import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.telephony.RILConstants;
 import com.android.internal.telephony.uicc.IccRecords;
@@ -113,6 +115,8 @@ public final class DcTracker extends DcTrackerBase {
     /** Watches for changes to the APN db. */
     private ApnChangeObserver mApnObserver;
 
+    private CdmaSubscriptionSourceManager mCdmaSsm;
+
     //***** Constructor
 
     public DcTracker(PhoneBase p) {
@@ -138,6 +142,14 @@ public final class DcTracker extends DcTrackerBase {
                 DctConstants.EVENT_PS_RESTRICT_ENABLED, null);
         p.getServiceStateTracker().registerForPsRestrictedDisabled(this,
                 DctConstants.EVENT_PS_RESTRICT_DISABLED, null);
+
+        if (p.getPhoneType() == PhoneConstants.PHONE_TYPE_CDMA) {
+            mCdmaSsm = CdmaSubscriptionSourceManager.getInstance(
+                    p.getContext(), p.mCi, this,
+                    DctConstants.EVENT_CDMA_SUBSCRIPTION_SOURCE_CHANGED, null);
+            // CdmaSsm doesn't send this event whenever you register - fake it ourselves
+           sendMessage(obtainMessage(DctConstants.EVENT_CDMA_SUBSCRIPTION_SOURCE_CHANGED));
+        }
 
         mDataConnectionTracker = this;
 
@@ -192,6 +204,10 @@ public final class DcTracker extends DcTrackerBase {
         mPhone.getContext().getContentResolver().unregisterContentObserver(mApnObserver);
         mApnContexts.clear();
         mPrioritySortedApnContexts.clear();
+
+        if (mCdmaSsm != null) {
+            mCdmaSsm.dispose(this);
+        }
 
         destroyDataConnections();
     }
@@ -437,7 +453,8 @@ public final class DcTracker extends DcTrackerBase {
     @Override
     public synchronized int enableApnType(String apnType) {
         ApnContext apnContext = mApnContexts.get(apnType);
-        if (apnContext == null || !isApnTypeAvailable(apnType)) {
+        if (apnContext == null || (!TextUtils.equals(apnType, PhoneConstants.APN_TYPE_DEFAULT)
+                && !isApnTypeAvailable(apnType))) {
             if (DBG) log("enableApnType: " + apnType + " is type not available");
             return PhoneConstants.APN_TYPE_NOT_AVAILABLE;
         }
@@ -448,6 +465,12 @@ public final class DcTracker extends DcTrackerBase {
         if (apnContext.getState() == DctConstants.State.CONNECTED) {
             if (DBG) log("enableApnType: return APN_ALREADY_ACTIVE");
             return PhoneConstants.APN_ALREADY_ACTIVE;
+        }
+        if (mPhone.mCi.needsOldRilFeature("singlepdp") && !PhoneConstants.APN_TYPE_DEFAULT.equals(apnType)) {
+            ApnContext defContext = mApnContexts.get(PhoneConstants.APN_TYPE_DEFAULT);
+            if (defContext.isEnabled()) {
+                setEnabled(apnTypeToId(PhoneConstants.APN_TYPE_DEFAULT), false);
+            }
         }
         setEnabled(apnTypeToId(apnType), true);
         if (DBG) {
@@ -464,6 +487,9 @@ public final class DcTracker extends DcTrackerBase {
 
         if (apnContext != null) {
             setEnabled(apnTypeToId(type), false);
+            if (mPhone.mCi.needsOldRilFeature("singlepdp") && !PhoneConstants.APN_TYPE_DEFAULT.equals(type)) {
+                setEnabled(apnTypeToId(PhoneConstants.APN_TYPE_DEFAULT), true);
+            }
             if (apnContext.getState() != DctConstants.State.IDLE && apnContext.getState()
                     != DctConstants.State.FAILED) {
                 if (DBG) log("diableApnType: return APN_REQUEST_STARTED");
@@ -565,10 +591,11 @@ public final class DcTracker extends DcTrackerBase {
         boolean desiredPowerState = mPhone.getServiceStateTracker().getDesiredPowerState();
         IccRecords r = mIccRecords.get();
         boolean recordsLoaded = (r != null) ? r.getRecordsLoaded() : false;
+        boolean subscriptionFromNv = isNvSubscription();
 
         boolean allowed =
                     (attachedState || mAutoAttachOnCreation) &&
-                    recordsLoaded &&
+                    (subscriptionFromNv || recordsLoaded) &&
                     (mPhone.getState() == PhoneConstants.State.IDLE ||
                      mPhone.getServiceStateTracker().isConcurrentVoiceAndDataAllowed()) &&
                     internalDataEnabled &&
@@ -580,7 +607,9 @@ public final class DcTracker extends DcTrackerBase {
             if (!(attachedState || mAutoAttachOnCreation)) {
                 reason += " - Attached= " + attachedState;
             }
-            if (!recordsLoaded) reason += " - SIM not loaded";
+            if (!(subscriptionFromNv || recordsLoaded)) {
+                reason += " - SIM not loaded and not NV subscription";
+            }
             if (mPhone.getState() != PhoneConstants.State.IDLE &&
                     !mPhone.getServiceStateTracker().isConcurrentVoiceAndDataAllowed()) {
                 reason += " - PhoneState= " + mPhone.getState();
@@ -614,6 +643,7 @@ public final class DcTracker extends DcTrackerBase {
     }
 
     private boolean trySetupData(ApnContext apnContext) {
+        boolean retValue = false;
         if (DBG) {
             log("trySetupData for type:" + apnContext.getApnType() +
                     " due to " + apnContext.getReason() + " apnContext=" + apnContext);
@@ -644,10 +674,13 @@ public final class DcTracker extends DcTrackerBase {
                 ArrayList<ApnSetting> waitingApns = buildWaitingApns(apnContext.getApnType(),
                         radioTech);
                 if (waitingApns.isEmpty()) {
-                    notifyNoData(DcFailCause.MISSING_UNKNOWN_APN, apnContext);
                     notifyOffApnsOfAvailability(apnContext.getReason());
-                    if (DBG) log("trySetupData: X No APN found retValue=false");
-                    return false;
+                    retValue = setupData(apnContext, radioTech);
+                    if(!retValue) {
+                        notifyNoData(DcFailCause.MISSING_UNKNOWN_APN, apnContext);
+                    }
+                    notifyOffApnsOfAvailability(apnContext.getReason());
+                    return retValue;
                 } else {
                     apnContext.setWaitingApns(waitingApns);
                     if (DBG) {
@@ -661,7 +694,7 @@ public final class DcTracker extends DcTrackerBase {
                 log("trySetupData: call setupData, waitingApns : "
                         + apnListToString(apnContext.getWaitingApns()));
             }
-            boolean retValue = setupData(apnContext, radioTech);
+            retValue = setupData(apnContext, radioTech);
             notifyOffApnsOfAvailability(apnContext.getReason());
 
             if (DBG) log("trySetupData: X retValue=" + retValue);
@@ -1008,8 +1041,29 @@ public final class DcTracker extends DcTrackerBase {
         int profileId = getApnProfileID(apnContext.getApnType());
         apnSetting = apnContext.getNextWaitingApn();
         if (apnSetting == null) {
-            if (DBG) log("setupData: return for no apn found!");
-            return false;
+            if(PhoneConstants.PHONE_TYPE_CDMA==mPhone.getPhoneType()) {
+                String[] mDunApnTypes = { PhoneConstants.APN_TYPE_DUN };
+                final int mDefaultApnId = DctConstants.APN_DEFAULT_ID;
+                final String[] mDefaultApnTypes = {
+                    PhoneConstants.APN_TYPE_DEFAULT,
+                    PhoneConstants.APN_TYPE_MMS,
+                    PhoneConstants.APN_TYPE_HIPRI };
+                String[] types;
+                int apnId;
+                if (mRequestedApnType.equals(PhoneConstants.APN_TYPE_DUN)) {
+                    types = mDunApnTypes;
+                    apnId = DctConstants.APN_DUN_ID;
+                } else {
+                    types = mDefaultApnTypes;
+                    apnId = mDefaultApnId;
+                }
+                apnSetting = new ApnSetting(apnId, "", "", "", "", "", "", "", "", "",
+                                            "", 0, types, "IP", "IP", true, 0);
+                if (DBG) log("setupData: CDMA detected and apnSetting == null, use stubbed CDMA APN setting= " + apnSetting);
+            } else {
+                if (DBG) log("setupData: return for no apn found!");
+                return false;
+            }
         }
 
         dcac = checkForCompatibleConnectedApnContext(apnContext);
@@ -1951,6 +2005,19 @@ public final class DcTracker extends DcTrackerBase {
         notifyOffApnsOfAvailability(reason);
     }
 
+    private boolean isNvSubscription() {
+        int radioTech = mPhone.getServiceState().getRilDataRadioTechnology();
+        if (mCdmaSsm == null) {
+            return false;
+        }
+        if (UiccController.getFamilyFromRadioTechnology(radioTech) == UiccController.APP_FAM_3GPP2
+                && mCdmaSsm.getCdmaSubscriptionSource() ==
+                        CdmaSubscriptionSourceManager.SUBSCRIPTION_FROM_NV) {
+            return true;
+        }
+        return false;
+    }
+
     /**
      * Based on the sim operator numeric, create a list for all possible
      * Data Connections and setup the preferredApn.
@@ -1958,7 +2025,11 @@ public final class DcTracker extends DcTrackerBase {
     private void createAllApnList() {
         mAllApnSettings = new ArrayList<ApnSetting>();
         IccRecords r = mIccRecords.get();
-        String operator = (r != null) ? r.getOperatorNumeric() : "";
+        String homeOperator = "";
+        if (isNvSubscription()){
+            homeOperator = SystemProperties.get("ro.cdma.home.operator.numeric");
+        }
+        String operator = (r != null) ? r.getOperatorNumeric() : homeOperator;
         if (operator != null) {
             String selection = "numeric = '" + operator + "'";
             // query only enabled apn.
@@ -2043,7 +2114,11 @@ public final class DcTracker extends DcTrackerBase {
         }
 
         IccRecords r = mIccRecords.get();
-        String operator = (r != null) ? r.getOperatorNumeric() : "";
+        String homeOperator = "";
+        if (isNvSubscription()){
+            homeOperator = SystemProperties.get("ro.cdma.home.operator.numeric");
+        }
+        String operator = (r != null) ? r.getOperatorNumeric() : homeOperator;
 
         // This is a workaround for a bug (7305641) where we don't failover to other
         // suitable APNs if our preferred APN fails.  On prepaid ATT sims we need to

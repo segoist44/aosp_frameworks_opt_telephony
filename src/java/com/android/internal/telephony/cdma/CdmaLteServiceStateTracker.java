@@ -46,7 +46,7 @@ import java.util.List;
 public class CdmaLteServiceStateTracker extends CdmaServiceStateTracker {
     private CDMALTEPhone mCdmaLtePhone;
     private final CellInfoLte mCellInfoLte;
-
+    protected int mNewRilRadioTechnology = 0;
     private CellIdentityLte mNewCellIdentityLte = new CellIdentityLte();
     private CellIdentityLte mLasteCellIdentityLte = new CellIdentityLte();
 
@@ -257,6 +257,19 @@ public class CdmaLteServiceStateTracker extends CdmaServiceStateTracker {
 
     @Override
     protected void pollStateDone() {
+        // Some older CDMA/LTE RILs only report VoiceRadioTechnology which results in network
+        // Unknown. In these cases return RilVoiceRadioTechnology for RilDataRadioTechnology.
+        boolean oldRil = mCi.needsOldRilFeature("usevoicetechfordata");
+        if (mNewSS.getDataRegState() != ServiceState.STATE_IN_SERVICE && oldRil) {
+            // LTE out of service, get CDMA Service State
+            mNewRilRadioTechnology = mNewSS.getRilVoiceRadioTechnology();
+            mNewSS.setDataRegState(radioTechnologyToDataServiceState(mNewRilRadioTechnology));
+            mNewSS.setRilDataRadioTechnology(mNewRilRadioTechnology);
+            log("pollStateDone CDMA STATE_IN_SERVICE mNewRilRadioTechnology = " +
+                    mNewRilRadioTechnology + " mNewSS.getDataRegState() = " +
+                    mNewSS.getDataRegState());
+        }
+
         log("pollStateDone: lte 1 ss=[" + mSS + "] newSS=[" + mNewSS + "]");
 
         useDataRegStateForDataOnlyDevices();
@@ -353,6 +366,9 @@ public class CdmaLteServiceStateTracker extends CdmaServiceStateTracker {
         if (hasDataRadioTechnologyChanged) {
             mPhone.setSystemProperty(TelephonyProperties.PROPERTY_DATA_NETWORK_TYPE,
                     ServiceState.rilRadioTechnologyToString(mSS.getRilDataRadioTechnology()));
+
+            // Query Signalstrength when there is a change in PS RAT.
+            sendMessage(obtainMessage(EVENT_POLL_SIGNAL_STRENGTH));
         }
 
         if (hasRegistered) {
@@ -360,7 +376,7 @@ public class CdmaLteServiceStateTracker extends CdmaServiceStateTracker {
         }
 
         if (hasChanged) {
-            if (mPhone.isEriFileLoaded()) {
+            if ((mCi.getRadioState().isOn()) && (mPhone.isEriFileLoaded())) {
                 String eriText;
                 // Now the CDMAPhone sees the new ServiceState so it can get the
                 // new ERI text
@@ -515,8 +531,15 @@ public class CdmaLteServiceStateTracker extends CdmaServiceStateTracker {
 
     @Override
     public boolean isConcurrentVoiceAndDataAllowed() {
-        // Using the Conncurrent Service Supported flag for CdmaLte devices.
-        return mSS.getCssIndicator() == 1;
+        // For LTE set true, else if the SVDO property is set, else use the CSS indicator to
+        // check for concurrent voice and data capability
+        if (mSS.getRilDataRadioTechnology() == ServiceState.RIL_RADIO_TECHNOLOGY_LTE) {
+            return true;
+        } else if (SystemProperties.getBoolean(TelephonyProperties.PROPERTY_SVDO, false)) {
+            return true;
+        } else {
+            return mSS.getCssIndicator() == 1;
+        }
     }
 
     /**
